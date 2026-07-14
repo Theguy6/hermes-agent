@@ -48,6 +48,10 @@ from agent.tool_guardrails import (
     ToolGuardrailDecision,
 )
 from hermes_cli.config import cfg_get
+from hermes_cli.config_value_parsing import (
+    parse_ratio_config_value,
+    parse_token_count_config_value,
+)
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
 from utils import base_url_host_matches, is_truthy_value
@@ -88,6 +92,26 @@ def _build_codex_gpt5_autoraise_notice(autoraise: Dict[str, Any]) -> str:
         f"summarizing.\n"
         f"  Opt back out: hermes config set compression.codex_gpt55_autoraise false"
     )
+
+
+def _parse_compression_ratio(raw: Any, default: float, key: str) -> float:
+    parsed = parse_ratio_config_value(raw)
+    if parsed is not None:
+        return parsed
+    _ra().logger.warning(
+        "Invalid %s in config.yaml: %r — must be a ratio from 0-1 "
+        "or a percentage like 75%%. Falling back to %.2f.",
+        key,
+        raw,
+        default,
+    )
+    print(
+        f"\n⚠ Invalid {key} in config.yaml: {raw!r}\n"
+        "  Must be a ratio from 0-1 or a percentage like 75%.\n"
+        f"  Falling back to {default:.2f}.\n",
+        file=sys.stderr,
+    )
+    return default
 
 
 def _resolve_compression_threshold(
@@ -1532,7 +1556,11 @@ def init_agent(
     _compression_cfg = _agent_cfg.get("compression", {})
     if not isinstance(_compression_cfg, dict):
         _compression_cfg = {}
-    compression_threshold = float(_compression_cfg.get("threshold", 0.50))
+    compression_threshold = _parse_compression_ratio(
+        _compression_cfg.get("threshold", 0.50),
+        0.50,
+        "compression.threshold",
+    )
     # Per-model/route compaction-threshold override. Codex gpt-5.4 / gpt-5.5
     # raise to 85% (the Codex backend caps both families at 272K, so the
     # default 50% would compact at ~136K — half the usable context). Gated by
@@ -1578,7 +1606,11 @@ def init_agent(
     except Exception:
         pass
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
-    compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
+    compression_target_ratio = _parse_compression_ratio(
+        _compression_cfg.get("target_ratio", 0.20),
+        0.20,
+        "compression.target_ratio",
+    )
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
     # protect_first_n is the number of non-system messages to protect at
     # the head, in addition to the system prompt (which is always
@@ -1623,10 +1655,7 @@ def init_agent(
     else:
         _aux_context_config = None
     if _aux_context_config is not None:
-        try:
-            _aux_context_config = int(_aux_context_config)
-        except (TypeError, ValueError):
-            _aux_context_config = None
+        _aux_context_config = parse_token_count_config_value(_aux_context_config)
     agent._aux_compression_context_length_config = _aux_context_config
 
     # Read explicit model output-token override from config when the
@@ -1663,22 +1692,23 @@ def init_agent(
     else:
         _config_context_length = None
     if _config_context_length is not None:
-        try:
-            _config_context_length = int(_config_context_length)
-        except (TypeError, ValueError):
+        _parsed_context_length = parse_token_count_config_value(_config_context_length)
+        if _parsed_context_length is None:
             _ra().logger.warning(
                 "Invalid model.context_length in config.yaml: %r — "
-                "must be a plain integer (e.g. 256000, not '256K'). "
+                "must be a positive token count (e.g. 256000, '256K', or '1.05M'). "
                 "Falling back to auto-detection.",
                 _config_context_length,
             )
             print(
                 f"\n⚠ Invalid model.context_length in config.yaml: {_config_context_length!r}\n"
-                f"  Must be a plain integer (e.g. 256000, not '256K').\n"
+                "  Must be a positive token count (e.g. 256000, '256K', or '1.05M').\n"
                 f"  Falling back to auto-detected context window.\n",
                 file=sys.stderr,
             )
             _config_context_length = None
+        else:
+            _config_context_length = _parsed_context_length
 
     # Resolve custom_providers list once for reuse below (startup
     # context-length override and plugin context-engine init).
@@ -1724,21 +1754,17 @@ def init_agent(
                         if isinstance(_cp_model_cfg, dict):
                             _cp_ctx = _cp_model_cfg.get("context_length")
                             if _cp_ctx is not None:
-                                try:
-                                    _parsed = int(_cp_ctx)
-                                    if _parsed <= 0:
-                                        raise ValueError
-                                except (TypeError, ValueError):
+                                if parse_token_count_config_value(_cp_ctx) is None:
                                     _ra().logger.warning(
                                         "Invalid context_length for model %r in "
                                         "custom_providers: %r — must be a positive "
-                                        "integer (e.g. 256000, not '256K'). "
+                                        "token count (e.g. 256000, '256K', or '1.05M'). "
                                         "Falling back to auto-detection.",
                                         agent.model, _cp_ctx,
                                     )
                                     print(
                                         f"\n⚠ Invalid context_length for model {agent.model!r} in custom_providers: {_cp_ctx!r}\n"
-                                        f"  Must be a positive integer (e.g. 256000, not '256K').\n"
+                                        "  Must be a positive token count (e.g. 256000, '256K', or '1.05M').\n"
                                         f"  Falling back to auto-detected context window.\n",
                                         file=sys.stderr,
                                     )

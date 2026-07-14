@@ -124,6 +124,27 @@ class TestConfigYamlRouting:
             or "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=True" in env_content
         )
 
+    @pytest.mark.parametrize(
+        ("key", "raw", "expected"),
+        [
+            ("compression.threshold", "75%", 0.75),
+            ("compression.target_ratio", "20", 0.20),
+            ("model.context_length", "1.05M", 1_050_000),
+            ("providers.local.context_length", "256K", 256_000),
+        ],
+    )
+    def test_human_friendly_numeric_values_are_normalized(
+        self, _isolated_hermes_home, key, raw, expected
+    ):
+        set_config_value(key, raw)
+
+        import yaml
+
+        node = yaml.safe_load(_read_config(_isolated_hermes_home))
+        for part in key.split("."):
+            node = node[part]
+        assert node == expected
+
 
 # ---------------------------------------------------------------------------
 # Empty / falsy values — regression tests for #4277

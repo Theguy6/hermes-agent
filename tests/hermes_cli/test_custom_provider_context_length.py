@@ -83,12 +83,8 @@ class TestGetCustomProviderContextLength:
             is None
         )
 
-    def test_returns_none_for_string_value(self):
-        """'256K' string is not a valid int — skip silently.
-
-        (The inline startup path still emits a user-visible warning; the
-        helper itself returns None so downstream fallbacks can run.)
-        """
+    def test_returns_suffix_string_value(self):
+        """A compact human token count is normalized for runtime use."""
         custom = [
             {
                 "base_url": "https://example.invalid/v1",
@@ -99,7 +95,7 @@ class TestGetCustomProviderContextLength:
             get_custom_provider_context_length(
                 "m", "https://example.invalid/v1", custom
             )
-            is None
+            == 256_000
         )
 
     def test_returns_none_for_zero_or_negative(self):

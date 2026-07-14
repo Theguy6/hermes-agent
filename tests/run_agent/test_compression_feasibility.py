@@ -472,6 +472,36 @@ def test_replay_without_callback_is_noop():
     agent._replay_compression_warning()
 
 
+def test_agent_init_accepts_human_friendly_compression_and_context_values():
+    """Human config values must normalize before compressor construction."""
+    cfg = {
+        "model": {"context_length": "1.05M"},
+        "compression": {"threshold": "75%", "target_ratio": "20%"},
+        "auxiliary": {"compression": {"context_length": "272K"}},
+    }
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://example.invalid/v1",
+            provider="custom",
+            model="test-model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert agent._config_context_length == 1_050_000
+    assert agent._aux_compression_context_length_config == 272_000
+    assert agent.context_compressor.threshold_percent == 0.75
+    assert agent.context_compressor.summary_target_ratio == 0.20
+
+
 @patch("agent.model_metadata.get_model_context_length", return_value=80_000)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 def test_run_conversation_clears_warning_after_replay(mock_get_client, mock_ctx_len):
