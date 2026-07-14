@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 from unittest import mock
@@ -567,6 +568,107 @@ class TestSubprocessCompatHelpers:
             # No start_new_session on Windows (silently no-op there).
             assert "start_new_session" not in kwargs
 
+    def test_spawn_detached_process_uses_posix_spawn_setsid_and_file_actions(
+        self, monkeypatch
+    ):
+        if sys.platform == "win32":
+            pytest.skip("POSIX-only behavior")
+        from hermes_cli import _subprocess_compat as sc
+
+        calls = []
+        opened = []
+        closed = []
+
+        next_fd = iter((17, 18, 19))
+        monkeypatch.setattr(
+            sc.os,
+            "open",
+            lambda path, flags: opened.append((path, flags)) or next(next_fd),
+        )
+        monkeypatch.setattr(sc.os, "close", lambda fd: closed.append(fd))
+        monkeypatch.setattr(
+            sc.os,
+            "posix_spawnp",
+            lambda path, argv, env, **kwargs: calls.append((path, argv, env, kwargs)) or 12345,
+        )
+
+        proc = sc.spawn_detached_process(
+            ["hermes", "gateway"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={"A": "B"},
+        )
+
+        assert proc.pid == 12345
+        assert calls == [
+            (
+                "hermes",
+                ["hermes", "gateway"],
+                {"A": "B"},
+                {
+                    "setsid": True,
+                    "file_actions": [
+                        (sc.os.POSIX_SPAWN_DUP2, 17, 0),
+                        (sc.os.POSIX_SPAWN_CLOSE, 17),
+                        (sc.os.POSIX_SPAWN_DUP2, 18, 1),
+                        (sc.os.POSIX_SPAWN_CLOSE, 18),
+                        (sc.os.POSIX_SPAWN_DUP2, 19, 2),
+                        (sc.os.POSIX_SPAWN_CLOSE, 19),
+                    ],
+                },
+            )
+        ]
+        assert opened == [
+            (sc.os.devnull, sc.os.O_RDONLY),
+            (sc.os.devnull, sc.os.O_WRONLY),
+            (sc.os.devnull, sc.os.O_WRONLY),
+        ]
+        assert closed == [17, 18, 19]
+
+    def test_spawn_detached_process_does_not_close_remapped_standard_fd(
+        self, monkeypatch
+    ):
+        if sys.platform == "win32":
+            pytest.skip("POSIX-only behavior")
+        from hermes_cli import _subprocess_compat as sc
+
+        calls = []
+        monkeypatch.setattr(sc.os, "open", lambda _path, _flags: 1)
+        monkeypatch.setattr(sc.os, "close", lambda _fd: None)
+        monkeypatch.setattr(
+            sc.os,
+            "posix_spawnp",
+            lambda path, argv, env, **kwargs: calls.append(kwargs) or 12345,
+        )
+
+        sc.spawn_detached_process(["hermes"], stdout=subprocess.DEVNULL)
+
+        assert calls[0]["file_actions"] == [(sc.os.POSIX_SPAWN_DUP2, 1, 1)]
+
+    def test_spawn_detached_process_windows_retries_without_breakaway(self, monkeypatch):
+        from hermes_cli import _subprocess_compat as sc
+
+        sentinel = object()
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if len(calls) == 1:
+                raise PermissionError("breakaway denied")
+            return sentinel
+
+        monkeypatch.setattr(sc, "IS_WINDOWS", True)
+        monkeypatch.setattr(sc.subprocess, "Popen", fake_popen)
+
+        result = sc.spawn_detached_process(["hermes", "gateway"], env={"A": "B"})
+
+        assert result is sentinel
+        assert len(calls) == 2
+        assert calls[0][1]["creationflags"] == sc.windows_detach_flags()
+        assert calls[1][1]["creationflags"] == sc.windows_detach_flags_without_breakaway()
+        assert calls[1][1]["env"] == {"A": "B"}
+
     def test_windows_detach_flags_has_expected_win32_bits(self, monkeypatch):
         """Simulate Windows to verify flag bundle."""
         from hermes_cli import _subprocess_compat as sc
@@ -916,16 +1018,19 @@ class TestGatewayDetachedWatcherWindowsFlags:
     launcher must use CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS on
     Windows, not silent start_new_session=True."""
 
-    def test_hermes_cli_gateway_uses_compat_kwargs(self):
+    def test_hermes_cli_gateway_uses_safe_detached_spawn(self):
         root = Path(__file__).resolve().parents[2]
         source = (root / "hermes_cli" / "gateway.py").read_text(encoding="utf-8")
-        assert "windows_detach_popen_kwargs" in source, (
-            "hermes_cli/gateway.py must use the platform-aware detach helper"
+        assert "spawn_detached_process" in source, (
+            "hermes_cli/gateway.py must use the fork-safe detached spawn helper"
         )
-        # The legacy start_new_session=True on the outer Popen should be
-        # replaced by **windows_detach_popen_kwargs(). Inside the watcher
-        # STRING the old pattern is replaced by explicit creationflags.
-        assert "**windows_detach_popen_kwargs()" in source
+        # The outer watcher is launched by a potentially threaded process and
+        # must not use Popen(start_new_session=True) on POSIX. The tiny watcher
+        # payload remains safe to use Popen because it is single-threaded.
+        outer_block = source[
+            source.index("watcher_argv = "):source.index("def _probe_systemd_service_running")
+        ]
+        assert "spawn_detached_process(" in outer_block
 
     def test_gateway_run_update_has_windows_branch(self):
         root = Path(__file__).resolve().parents[2]

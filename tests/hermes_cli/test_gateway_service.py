@@ -704,13 +704,15 @@ class TestLaunchdServiceRecovery:
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
 
-        popen_calls = []
+        spawn_calls = []
 
-        def fake_popen(cmd, **kwargs):
-            popen_calls.append((cmd, kwargs))
+        def fake_spawn(cmd, **kwargs):
+            spawn_calls.append((cmd, kwargs))
             return SimpleNamespace(pid=9999)
 
-        monkeypatch.setattr(gateway_cli.subprocess, "Popen", fake_popen)
+        import hermes_cli._subprocess_compat as subprocess_compat
+
+        monkeypatch.setattr(subprocess_compat, "spawn_detached_process", fake_spawn)
 
         result = gateway_cli.refresh_launchd_plist_if_needed()
 
@@ -719,11 +721,10 @@ class TestLaunchdServiceRecovery:
         assert "--replace" in plist_path.read_text(encoding="utf-8")
         # No DIRECT bootout/bootstrap ran (those would kill us mid-sequence).
         assert not [c for c in run_calls if "bootout" in c or "bootstrap" in c]
-        # Exactly one detached helper was spawned, in a new session, and it
-        # performs both bootout and bootstrap.
-        assert len(popen_calls) == 1
-        cmd, kwargs = popen_calls[0]
-        assert kwargs.get("start_new_session") is True
+        # Exactly one detached helper was spawned, and it performs both
+        # bootout and bootstrap.
+        assert len(spawn_calls) == 1
+        cmd, kwargs = spawn_calls[0]
         script = cmd[-1]
         assert "bootout" in script and "bootstrap" in script
         assert str(plist_path) in script

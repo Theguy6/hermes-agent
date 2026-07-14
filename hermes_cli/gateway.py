@@ -727,9 +727,9 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
     # respawns the gateway once it's gone.  Both legs of the chain need
     # platform-appropriate detach semantics:
     #
-    # POSIX — ``start_new_session=True`` (os.setsid in the child) detaches
-    # from the parent's process group so Ctrl+C in the CLI doesn't
-    # propagate and the watcher/gateway survive the CLI exiting.
+    # POSIX — spawn_detached_process uses posix_spawnp(..., setsid=True)
+    # where available, so threaded gateway parents do not fork and deadlock
+    # before exec. It falls back to start_new_session=True when needed.
     #
     # Windows — ``start_new_session`` is silently accepted but does NOT
     # detach.  The watcher stays attached to the CLI's console and dies
@@ -738,11 +738,10 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
     # manually.  The Win32 equivalent is the ``CREATE_NEW_PROCESS_GROUP |
     # DETACHED_PROCESS | CREATE_NO_WINDOW`` creationflags bundle.
     #
-    # ``windows_detach_popen_kwargs()`` returns the right kwargs for the
-    # host platform and is a no-op on POSIX (just ``start_new_session=True``).
+    # spawn_detached_process centralizes the host-specific detach behavior.
     from hermes_cli._subprocess_compat import (
+        spawn_detached_process,
         windows_detach_flags_without_breakaway,
-        windows_detach_popen_kwargs,
     )
 
     # On Windows the incoming ``run_argv`` leads with the venv's console
@@ -851,33 +850,16 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
 
     # Same platform-aware detach for the watcher process itself — so
     # closing the user's terminal doesn't kill the watcher.
+    # spawn_detached_process already handles the Windows BREAKAWAY retry
+    # internally; a surviving OSError means both attempts failed.
     try:
-        subprocess.Popen(
+        spawn_detached_process(
             watcher_argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            **windows_detach_popen_kwargs(),
         )
     except OSError:
-        # CREATE_BREAKAWAY_FROM_JOB rejected by the parent job object
-        # (Electron, Windows Terminal with restrictive job settings, …).
-        # Retry without it. POSIX never reaches this branch — there
-        # ``start_new_session=True`` cannot raise OSError — so the
-        # fallback is only meaningful on Windows.
-        try:
-            fallback_kwargs: dict = (
-                {"creationflags": windows_detach_flags_without_breakaway()}
-                if sys.platform == "win32"
-                else {"start_new_session": True}
-            )
-            subprocess.Popen(
-                watcher_argv,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                **fallback_kwargs,
-            )
-        except OSError:
-            return False
+        return False
     return True
 
 
@@ -3749,7 +3731,7 @@ def _spawn_detached_gateway() -> bool:
     gateway logs and the PID is tracked via the gateway.pid file that
     `run_gateway` writes, so stop/status/restart keep working.
     """
-    from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+    from hermes_cli._subprocess_compat import spawn_detached_process
 
     log_dir = get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -3762,12 +3744,11 @@ def _spawn_detached_gateway() -> bool:
         return False
     try:
         with out, err:
-            subprocess.Popen(
+            spawn_detached_process(
                 _gateway_run_command(),
                 stdin=subprocess.DEVNULL,
                 stdout=out,
                 stderr=err,
-                **windows_detach_popen_kwargs(),
             )
     except OSError:
         return False
@@ -3996,9 +3977,10 @@ def refresh_launchd_plist_if_needed() -> bool:
             f"fi"
         )
         try:
-            subprocess.Popen(
+            from hermes_cli._subprocess_compat import spawn_detached_process
+
+            spawn_detached_process(
                 ["/bin/bash", "-c", reload_script],
-                start_new_session=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )

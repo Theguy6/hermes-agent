@@ -6174,22 +6174,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         watcher_env = os.environ.copy()
         watcher_env.pop("_HERMES_GATEWAY", None)
         setsid_bin = shutil.which("setsid")
-        if setsid_bin:
-            subprocess.Popen(
-                [setsid_bin, "bash", "-lc", shell_cmd],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=watcher_env,
-                start_new_session=True,
-            )
-        else:
-            subprocess.Popen(
-                ["bash", "-lc", shell_cmd],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=watcher_env,
-                start_new_session=True,
-            )
+        from hermes_cli._subprocess_compat import spawn_detached_process
+
+        spawn_detached_process(
+            [setsid_bin, "bash", "-lc", shell_cmd]
+            if setsid_bin
+            else ["bash", "-lc", shell_cmd],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=watcher_env,
+        )
 
     def _launch_systemd_restart_shortcut(self) -> None:
         """Best-effort helper to bypass systemd's automatic restart delay.
@@ -6262,7 +6256,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"{systemctl_scope} restart {service_arg}"
             )
             unit_name = f"{service_name}-planned-restart-{current_pid}".replace(".", "-")
-            subprocess.Popen(
+            from hermes_cli._subprocess_compat import spawn_detached_process
+
+            spawn_detached_process(
                 [
                     systemd_run,
                     *scope_flags,
@@ -6275,7 +6271,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                start_new_session=True,
             )
             logger.info(
                 "Launched systemd planned-restart helper for %s (pid=%s, scope=%s)",

@@ -244,7 +244,7 @@ async def test_run_restart_excluded_from_stop_cancel_loop():
 @pytest.mark.asyncio
 async def test_launch_detached_restart_command_uses_setsid(monkeypatch):
     runner, _adapter = make_restart_runner()
-    popen_calls = []
+    spawn_calls = []
 
     monkeypatch.setattr(gateway_run.sys, "platform", "linux")
     monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["/usr/bin/hermes"])
@@ -252,21 +252,22 @@ async def test_launch_detached_restart_command_uses_setsid(monkeypatch):
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
     monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/setsid" if cmd == "setsid" else None)
 
-    def fake_popen(cmd, **kwargs):
-        popen_calls.append((cmd, kwargs))
+    import hermes_cli._subprocess_compat as subprocess_compat
+
+    def fake_spawn(cmd, **kwargs):
+        spawn_calls.append((cmd, kwargs))
         return MagicMock()
 
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(subprocess_compat, "spawn_detached_process", fake_spawn)
 
     await runner._launch_detached_restart_command()
 
-    assert len(popen_calls) == 1
-    cmd, kwargs = popen_calls[0]
+    assert len(spawn_calls) == 1
+    cmd, kwargs = spawn_calls[0]
     assert cmd[:2] == ["/usr/bin/setsid", "bash"]
     assert "gateway restart" in cmd[-1]
     assert "kill -0 321" in cmd[-1]
     assert "deadline=$(( $(date +%s) +" in cmd[-1]
-    assert kwargs["start_new_session"] is True
     assert kwargs["stdout"] is subprocess.DEVNULL
     assert kwargs["stderr"] is subprocess.DEVNULL
     # The watcher must NOT inherit the gateway marker, or the CLI's
@@ -277,17 +278,23 @@ async def test_launch_detached_restart_command_uses_setsid(monkeypatch):
 @pytest.mark.asyncio
 async def test_detached_restart_helper_is_idempotent(monkeypatch):
     runner, _adapter = make_restart_runner()
-    popen_calls = []
+    spawn_calls = []
 
     monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["/usr/bin/hermes"])
     monkeypatch.setattr(gateway_run.os, "getpid", lambda: 321)
     monkeypatch.setattr(shutil, "which", lambda cmd: None)
-    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: popen_calls.append((a, k)))
+    import hermes_cli._subprocess_compat as subprocess_compat
+
+    monkeypatch.setattr(
+        subprocess_compat,
+        "spawn_detached_process",
+        lambda *a, **k: spawn_calls.append((a, k)),
+    )
 
     await runner._launch_detached_restart_command()
     await runner._launch_detached_restart_command()
 
-    assert len(popen_calls) == 1
+    assert len(spawn_calls) == 1
 
 
 def test_windows_gateway_venv_imports_add_site_packages(monkeypatch, tmp_path):

@@ -20,20 +20,24 @@ Several common subprocess patterns break silently-or-loudly on Windows:
 This module centralizes the platform-branching logic so the rest of the
 codebase doesn't sprinkle ``if sys.platform == "win32":`` everywhere.
 
-**All helpers are no-ops on non-Windows** — calling them in Linux/macOS
-code paths is safe by design.  That's the "do no damage on POSIX"
-guarantee.
+The Windows-specific flag helpers remain no-ops on non-Windows. The detached
+spawn helper also provides the POSIX implementation needed by threaded gateway
+callers.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
+import subprocess
 import sys
-from typing import Sequence
+from types import SimpleNamespace
+from typing import Any, Sequence
 
 __all__ = [
     "IS_WINDOWS",
     "resolve_node_command",
+    "spawn_detached_process",
     "windows_detach_flags",
     "windows_detach_flags_without_breakaway",
     "windows_hide_flags",
@@ -232,3 +236,112 @@ def windows_detach_popen_kwargs() -> dict:
     if IS_WINDOWS:
         return {"creationflags": windows_detach_flags()}
     return {"start_new_session": True}
+
+
+def spawn_detached_process(
+    argv: Sequence[str],
+    *,
+    stdin=None,
+    stdout=None,
+    stderr=None,
+    env: dict[str, str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+):
+    """Spawn a detached child without forking a threaded POSIX parent.
+
+    Fire-and-forget gateway helpers only need a PID and redirected stdio.
+    On POSIX, use ``posix_spawnp(..., setsid=True)`` so detachment does not
+    copy the gateway's multi-threaded Python state before exec. Unsupported
+    argument/platform combinations retain the prior ``Popen`` behavior.
+    Windows uses the existing detach flags and retries without the breakaway
+    bit when a restrictive parent job rejects it.
+    """
+    if not argv:
+        raise ValueError("argv must not be empty")
+
+    if IS_WINDOWS:
+        kwargs = {
+            "stdin": stdin,
+            "stdout": stdout,
+            "stderr": stderr,
+            "env": env,
+            "cwd": cwd,
+            "creationflags": windows_detach_flags(),
+        }
+        try:
+            return subprocess.Popen(argv, **kwargs)
+        except OSError:
+            kwargs["creationflags"] = windows_detach_flags_without_breakaway()
+            return subprocess.Popen(argv, **kwargs)
+
+    unsupported_stdio = any(
+        target in (subprocess.PIPE, subprocess.STDOUT)
+        for target in (stdin, stdout, stderr)
+        if isinstance(target, int)
+    )
+    if (
+        cwd is not None
+        or unsupported_stdio
+        or not hasattr(os, "posix_spawnp")
+        or not hasattr(os, "POSIX_SPAWN_DUP2")
+        or not hasattr(os, "POSIX_SPAWN_CLOSE")
+    ):
+        return subprocess.Popen(
+            argv,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            env=env,
+            cwd=cwd,
+            start_new_session=True,
+        )
+
+    opened_fds: list[int] = []
+    file_actions: list[tuple[int, ...]] = []
+
+    def _add_dup2(target, child_fd: int, flags: int) -> None:
+        if target is None:
+            return
+        if target is subprocess.DEVNULL:
+            fd = os.open(os.devnull, flags)
+            opened_fds.append(fd)
+        elif isinstance(target, int):
+            fd = target
+        else:
+            fd = target.fileno()
+        file_actions.append((os.POSIX_SPAWN_DUP2, fd, child_fd))
+        # If opening /dev/null reused the standard descriptor itself, closing
+        # it after DUP2 would also close the child's redirected stdio.
+        if fd in opened_fds and fd != child_fd:
+            file_actions.append((os.POSIX_SPAWN_CLOSE, fd))
+
+    try:
+        _add_dup2(stdin, 0, os.O_RDONLY)
+        _add_dup2(stdout, 1, os.O_WRONLY)
+        _add_dup2(stderr, 2, os.O_WRONLY)
+
+        spawn_kwargs: dict[str, Any] = {"setsid": True}
+        if file_actions:
+            spawn_kwargs["file_actions"] = file_actions
+        pid = os.posix_spawnp(
+            argv[0],
+            list(argv),
+            dict(os.environ if env is None else env),
+            **spawn_kwargs,
+        )
+        return SimpleNamespace(pid=pid)
+    except (AttributeError, NotImplementedError, OSError, TypeError):
+        return subprocess.Popen(
+            argv,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            env=env,
+            start_new_session=True,
+        )
+    finally:
+        for fd in opened_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
