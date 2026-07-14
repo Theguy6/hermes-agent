@@ -29,6 +29,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
 
+from hermes_cli.config_value_parsing import (
+    parse_ratio_config_value,
+    parse_token_count_config_value,
+)
 from hermes_cli.secret_prompt import masked_secret_prompt
 
 logger = logging.getLogger(__name__)
@@ -4735,8 +4739,8 @@ def _normalize_custom_provider_entry(
         if normalized_models:
             normalized["models"] = normalized_models
 
-    context_length = entry.get("context_length")
-    if isinstance(context_length, int) and context_length > 0:
+    context_length = parse_token_count_config_value(entry.get("context_length"))
+    if context_length is not None:
         normalized["context_length"] = context_length
 
     rate_limit_delay = entry.get("rate_limit_delay")
@@ -5070,11 +5074,8 @@ def get_custom_provider_context_length(
         raw_ctx = model_cfg.get("context_length")
         if raw_ctx is None:
             continue
-        try:
-            ctx = int(raw_ctx)
-        except (TypeError, ValueError):
-            continue
-        if ctx > 0:
+        ctx = parse_token_count_config_value(raw_ctx)
+        if ctx is not None:
             return ctx
     return None
 
@@ -8025,17 +8026,29 @@ def set_config_value(key: str, value: str):
     # _set_nested which preserves list-typed nodes; before #17876 the
     # inline navigation here silently overwrote lists with dicts.
 
-    # Convert value to appropriate type
-    if value.lower() in {'true', 'yes', 'on'}:
-        value = True
-    elif value.lower() in {'false', 'no', 'off'}:
-        value = False
-    elif value.isdigit():
-        value = int(value)
-    elif value.replace('.', '', 1).isdigit():
-        value = float(value)
+    # Preserve values for string-typed settings.  In particular, enum members
+    # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
+    # retain the historical best-effort coercion behavior.
+    coerced_value: Any = value
+    normalized_key = key.strip().lower()
+    if normalized_key in {"compression.threshold", "compression.target_ratio"}:
+        parsed_ratio = parse_ratio_config_value(value)
+        if parsed_ratio is not None:
+            coerced_value = parsed_ratio
+    elif normalized_key == "context_length" or normalized_key.endswith(".context_length"):
+        parsed_tokens = parse_token_count_config_value(value)
+        if parsed_tokens is not None:
+            coerced_value = parsed_tokens
+    elif value and value.lower() in {'true', 'yes', 'on'}:
+        coerced_value = True
+    elif value and value.lower() in {'false', 'no', 'off'}:
+        coerced_value = False
+    elif value and value.isdigit():
+        coerced_value = int(value)
+    elif value and value.replace('.', '', 1).isdigit():
+        coerced_value = float(value)
 
-    _set_nested(user_config, key, value)
+    _set_nested(user_config, key, coerced_value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
     # key the runtime resolver actually reads, instead of being silently
