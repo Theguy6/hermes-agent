@@ -1740,6 +1740,81 @@ class TestCaptureAppFilterNoMatch:
         assert backend._active_pid == 200
         assert backend._active_window_id == 2
 
+    def test_app_filter_bundle_id_resolves_localized_window_by_pid(self):
+        windows = [
+            {"app_name": "計算機", "pid": 200, "window_id": 2,
+             "is_on_screen": True, "title": "Calculator", "z_index": 1},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+
+        def fake_call_tool(name, args):
+            if name == "list_windows":
+                return {"data": "", "images": [], "isError": False,
+                        "structuredContent": {"windows": windows}}
+            if name == "list_apps":
+                return {"data": {"apps": [{
+                    "name": "Calculator",
+                    "bundle_id": "com.apple.calculator",
+                    "pid": 200,
+                    "running": True,
+                }]}, "images": [], "isError": False,
+                        "structuredContent": None}
+            if name == "get_window_state":
+                assert args["pid"] == 200
+                assert args["window_id"] == 2
+                return {"data": '✅ 計算機 — 0 elements\n',
+                        "images": [], "isError": False,
+                        "structuredContent": None}
+            raise AssertionError(f"unexpected tool {name}")
+
+        backend._session.call_tool.side_effect = fake_call_tool
+        cap = backend.capture(mode="ax", app="com.apple.calculator")
+
+        assert cap.app == "計算機"
+        assert backend._active_pid == 200
+        assert backend._active_window_id == 2
+
+    def test_app_filter_retries_all_windows_for_offscreen_window(self):
+        visible_windows = [
+            {"app_name": "Code", "pid": 100, "window_id": 1,
+             "is_on_screen": True, "title": "editor", "z_index": 0},
+        ]
+        all_windows = visible_windows + [
+            {"app_name": "Calculator", "pid": 200, "window_id": 2,
+             "is_on_screen": False, "title": "Calculator", "z_index": 5},
+        ]
+        backend = _make_cua_backend_with_windows(visible_windows)
+
+        def fake_call_tool(name, args):
+            if name == "list_windows":
+                return {"data": "", "images": [], "isError": False,
+                        "structuredContent": {
+                            "windows": visible_windows if args["on_screen_only"] else all_windows
+                        }}
+            if name == "list_apps":
+                return {"data": [], "images": [], "isError": False,
+                        "structuredContent": None}
+            if name == "get_window_state":
+                assert args["pid"] == 200
+                assert args["window_id"] == 2
+                return {"data": '✅ Calculator — 0 elements\n',
+                        "images": [], "isError": False,
+                        "structuredContent": None}
+            raise AssertionError(f"unexpected tool {name}")
+
+        backend._session.call_tool.side_effect = fake_call_tool
+        cap = backend.capture(mode="ax", app="Calculator")
+
+        assert cap.app == "Calculator"
+        assert backend._active_pid == 200
+        assert backend._active_window_id == 2
+        list_window_modes = [
+            call.args[1]["on_screen_only"]
+            for call in backend._session.call_tool.call_args_list
+            if call.args[0] == "list_windows"
+        ]
+        assert list_window_modes == [True, False]
+
     def test_no_app_filter_still_picks_frontmost(self):
         """When no app= is given, capture continues to pick the frontmost
         window — the no-match early-return must not fire on the empty case."""
@@ -2776,6 +2851,8 @@ class TestSessionLifecycle:
         backend = self._backend_with_mock_session()
         # list_windows returns no windows so capture short-circuits early
         # — but the session arg should already be on the call.
+        backend._active_pid = None
+        backend._active_window_id = None
         backend._session.call_tool.return_value = {
             "data": "", "images": [], "image_mime_types": [],
             "structuredContent": {"windows": []}, "isError": False,
@@ -2795,6 +2872,42 @@ class TestSessionLifecycle:
         name, args = backend._session.call_tool.call_args.args
         assert name == "list_apps"
         assert args["session"] == backend._session_id
+
+    def test_list_apps_prefers_structured_apps(self):
+        backend = self._backend_with_mock_session()
+        backend._session.call_tool.return_value = {
+            "data": "text fallback should not win",
+            "images": [],
+            "image_mime_types": [],
+            "structuredContent": {
+                "apps": [
+                    {"name": "Calculator", "bundle_id": "com.apple.calculator", "pid": 99},
+                    "not-an-app",
+                ],
+            },
+            "isError": False,
+        }
+
+        assert backend.list_apps() == [
+            {"name": "Calculator", "bundle_id": "com.apple.calculator", "pid": 99},
+        ]
+
+    def test_list_apps_text_fallback_strips_bullet_and_reads_bundle_id(self):
+        backend = self._backend_with_mock_session()
+        backend._session.call_tool.return_value = {
+            "data": (
+                "✅ Found 1 app(s):\n"
+                "- Calculator (pid 99) [com.apple.calculator]\n"
+            ),
+            "images": [],
+            "image_mime_types": [],
+            "structuredContent": None,
+            "isError": False,
+        }
+
+        assert backend.list_apps() == [
+            {"name": "Calculator", "pid": 99, "bundle_id": "com.apple.calculator"},
+        ]
 
     def test_explicit_session_override_preserved(self):
         """An action coming in with an explicit `session` (e.g. a
@@ -2868,6 +2981,46 @@ class TestCuaToolCoverageExpansion:
         assert "name" not in args
         assert "creates_new_application_instance" not in args
         assert result["pid"] == 99
+
+    def test_launch_app_seeds_active_window_for_followup_capture(self):
+        backend = self._backend()
+        launch_windows = [{
+            "app_name": "Calculator",
+            "pid": 99,
+            "window_id": 7,
+            "is_on_screen": True,
+            "title": "Calculator",
+        }]
+
+        def fake_call_tool(name, args):
+            if name == "launch_app":
+                return {"data": "", "images": [], "image_mime_types": [],
+                        "structuredContent": {
+                            "pid": 99,
+                            "name": "Calculator",
+                            "bundle_id": "com.apple.calculator",
+                            "windows": launch_windows,
+                        }, "isError": False}
+            if name == "list_windows":
+                return {"data": "", "images": [], "image_mime_types": [],
+                        "structuredContent": {"windows": []}, "isError": False}
+            if name == "get_window_state":
+                assert args["pid"] == 99
+                assert args["window_id"] == 7
+                return {"data": '✅ Calculator — 0 elements\n',
+                        "images": [], "image_mime_types": [],
+                        "structuredContent": None, "isError": False}
+            raise AssertionError(f"unexpected tool {name}")
+
+        backend._session.call_tool.side_effect = fake_call_tool
+
+        backend.launch_app(bundle_id="com.apple.calculator")
+        cap = backend.capture(mode="ax")
+
+        assert backend._active_pid == 99
+        assert backend._active_window_id == 7
+        assert backend._last_app == "Calculator"
+        assert cap.app == "Calculator"
 
     def test_launch_app_carries_all_optional_args(self):
         backend = self._backend(structured={"pid": 1})
