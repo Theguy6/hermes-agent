@@ -224,15 +224,15 @@ class TestUpdateCommandGatewayFlag:
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
 
-        mock_popen = MagicMock()
+        mock_spawn = MagicMock()
         with patch("gateway.run._hermes_home", hermes_home), \
              patch("gateway.run.__file__", fake_file), \
              patch("shutil.which", side_effect=lambda x: f"/usr/bin/{x}"), \
-             patch("subprocess.Popen", mock_popen):
+             patch("hermes_cli._subprocess_compat.spawn_detached_process", mock_spawn):
             result = await runner._handle_update_command(event)
 
         # Check the bash command string contains --gateway and PYTHONUNBUFFERED
-        call_args = mock_popen.call_args[0][0]
+        call_args = mock_spawn.call_args[0][0]
         cmd_string = call_args[-1] if isinstance(call_args, list) else str(call_args)
         assert "--gateway" in cmd_string
         assert "PYTHONUNBUFFERED" in cmd_string
